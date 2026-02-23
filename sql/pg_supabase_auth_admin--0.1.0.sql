@@ -1,10 +1,26 @@
--- \echo Use "CREATE EXTENSION pg_supabase_auth_admin" to load this file. \quit
+SELECT pgtle.install_extension(
+  -- Extension name
+  'supabase_auth_admin',
+
+  -- Version
+  '0.0.1',
+
+  -- Description
+  'Supabase Auth Admin REST API wrapper using pg_vault and the http extension',
+
+  -- Extension body SQL (everything that runs at CREATE EXTENSION time)
+  $ext$
 
 -- ============================================================
 -- SETUP SCHEMA
 -- ============================================================
 
 create schema if not exists supabase_auth_admin;
+
+-- Prevent unprivileged access from public.
+alter default privileges in schema supabase_auth_admin revoke all on functions from public;
+
+-- TODO - Set RLS on Supabase Vault
 
 -- ============================================================
 -- INTERNAL HELPERS
@@ -72,9 +88,8 @@ declare
 begin
   v_api_key := supabase_auth_admin._get_service_role_key();
   return array[
-    http_header('Authorization', 'Bearer ' || v_api_key),
-    http_header('apikey', v_api_key),
-    http_header('Content-Type',  'application/json')
+    http_header('Authorization', format('Bearer %s', v_api_key)),
+    http_header('apikey', v_api_key)
   ];
 end;
 $$;
@@ -88,7 +103,7 @@ create or replace function supabase_auth_admin._request(
 returns jsonb
 language plpgsql
 security definer
-set search_path = extensions
+set search_path = supabase_auth_admin, extensions
 as $$
 declare
   v_url text;
@@ -96,12 +111,12 @@ declare
   v_status int;
   v_content text;
 begin
-  v_url := supabase_auth_admin._get_supabase_url() || '/auth/v1/admin' || p_path;
-  
+  v_url := format('%s/auth/v1/%s', _get_supabase_url(), p_path);
+
   v_response := http((
       p_method,
       v_url,
-      supabase_auth_admin._build_headers(),
+      _build_headers(),
       'application/json',
       case when p_body is not null then p_body::text else null end
     )::http_request);
@@ -120,11 +135,6 @@ begin
   return v_content::jsonb;
 end;
 $$;
-
-revoke all on function supabase_auth_admin._get_service_role_key() from public;
-revoke all on function supabase_auth_admin._get_supabase_url() from public;
-revoke all on function supabase_auth_admin._build_headers() from public;
-revoke all on function supabase_auth_admin._request(text, text, jsonb) from public;
 
 -- ============================================================
 -- SETUP HELPER
@@ -170,18 +180,41 @@ $$;
 -- USER MANAGEMENT
 -- ============================================================
 
+-- List users with pagination.
+-- SELECT supabase_auth_admin.list_users();
+-- SELECT supabase_auth_admin.list_users(p_page => 2, p_per_page => 100);
+create or replace function supabase_auth_admin.list_users(
+  p_page int default 1,
+  p_per_page int default 50
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+begin
+  return _request(
+    'get',
+    format('admin/users?page=%s&per_page=%s', p_page, p_per_page)
+  );
+end;
+$$;
+
 -- Get a single user by UUID.
 -- SELECT supabase_auth_admin.get_user('xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx');
 create or replace function supabase_auth_admin.get_user(p_user_id uuid)
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = supabase_auth_admin
 as $$
 declare
   v_body jsonb;
 begin
-  return supabase_auth_admin._request('GET', '/users/' || p_user_id::text);
+  return _request(
+    'get', 
+    format('admin/users/%s', p_user_id::text)
+    );
 end;
 $$;
 
@@ -194,17 +227,19 @@ create or replace function supabase_auth_admin.create_user(
   p_user_metadata jsonb default null,
   p_app_metadata jsonb default null,
   p_email_confirm boolean default false,
-  p_phone_confirm boolean default false
+  p_phone_confirm boolean default false,
+  p_id uuid default null
 )
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = supabase_auth_admin
 as $$
 declare
-  v_body jsonb := '{}'::jsonb;
+  v_body jsonb;
 begin
   v_body := jsonb_build_object(
+    'id', p_id,
     'email', p_email,
     'email_confirm', p_email_confirm,
     'password', p_password,
@@ -214,6 +249,186 @@ begin
     'phone_confirm', p_phone_confirm
     );
 
-  return supabase_auth_admin._request('POST', '/users', v_body);
+  return _request('POST', 'admin/users', v_body);
 end;
 $$;
+
+-- Update an existing user.
+-- SELECT supabase_auth_admin.update_user('uuid', p_email => 'new@example.com');
+-- SELECT supabase_auth_admin.update_user('uuid', p_ban_duration => '24h');   -- temp ban
+-- SELECT supabase_auth_admin.update_user('uuid', p_ban_duration => 'none');  -- unban
+create or replace function supabase_auth_admin.update_user(
+  p_user_id uuid,
+  p_email text default null,
+  p_password text default null,
+  p_phone text default null,
+  p_user_metadata jsonb default null,
+  p_app_metadata jsonb default null,
+  p_email_confirm boolean default null,
+  p_phone_confirm boolean default null,
+  p_ban_duration text default null  -- '24h' | '876000h' (permanent) | 'none'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+declare
+  v_body jsonb;
+begin
+  v_body := jsonb_build_object(
+    'email', p_email,
+    'password', p_password,
+    'phone', p_phone,
+    'user_metadata', p_user_metadata,
+    'app_metadata',  p_app_metadata,
+    'email_confirm', p_email_confirm,
+    'phone_confirm', p_phone_confirm,
+    'ban_duration',  p_ban_duration
+    );
+
+  return _request(
+    'put',
+    format('admin/users/%s', p_user_id::text),
+    v_body
+    );
+end;
+$$;
+
+-- Delete a user (hard delete by default).
+-- SELECT supabase_auth_admin.delete_user('uuid');
+-- SELECT supabase_auth_admin.delete_user('uuid', p_should_soft_delete => true);
+create or replace function supabase_auth_admin.delete_user(
+  p_user_id uuid,
+  p_should_soft_delete boolean default false
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+declare
+  v_body jsonb;
+begin
+  v_body := jsonb_build_object(
+    'should_soft_delete', p_should_soft_delete
+    );
+  return _request(
+    'delete',
+    format('admin/users/%s', p_user_id::text),
+    v_body
+    );
+end;
+$$;
+
+-- ============================================================
+-- INVITATIONS
+-- ============================================================
+
+-- Invite a user by email.
+-- SELECT supabase_auth_admin.invite_user_by_email('newuser@example.com');
+-- SELECT supabase_auth_admin.invite_user_by_email('newuser@example.com', '{"team":42}', 'https://app.com/welcome');
+create or replace function supabase_auth_admin.invite_user_by_email(
+  p_email text,
+  p_data jsonb default null,
+  p_redirect_to text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+declare
+  v_body jsonb;
+begin
+  v_body := jsonb_build_object(
+    'email', p_email,
+    'data', p_data,
+    'redirect_to', p_redirect_to
+    );
+
+  return _request('post', 'invite', v_body);
+end;
+$$;
+
+-- ============================================================
+-- MAGIC LINKS & OTP
+-- ============================================================
+
+-- Generate an action link for a user.
+-- Link types: signup | magiclink | recovery | email_change_new | email_change_current
+--
+-- SELECT supabase_auth_admin.generate_link('magiclink', 'user@example.com');
+-- SELECT supabase_auth_admin.generate_link('recovery', 'user@example.com');
+-- SELECT supabase_auth_admin.generate_link('signup', 'new@example.com', p_password => 'secret');
+create or replace function supabase_auth_admin.generate_link(
+  p_type text,
+  p_email text,
+  p_password text default null,
+  p_new_email text default null,
+  p_data jsonb default null,
+  p_redirect_to text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+declare
+  v_body jsonb;
+begin
+  v_body := jsonb_build_object(
+    'type', p_type,
+    'email', p_email,
+    'password', p_password,
+    'new_email', p_new_email,
+    'data', p_data,
+    'redirect_to', p_redirect_to
+    );
+
+  return _request('post', 'admin/generate_link', v_body);
+end;
+$$;
+
+-- ============================================================
+-- MFA FACTORS
+-- ============================================================
+
+-- List all enrolled MFA factors for a user.
+-- SELECT supabase_auth_admin.list_factors('uuid');
+create or replace function supabase_auth_admin.list_factors(p_user_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+begin
+  return _request(
+    'get',
+    format('admin/users/%s/factors', p_user_id::text)
+    );
+end;
+$$;
+
+-- Delete a specific MFA factor.
+-- SELECT supabase_auth_admin.delete_factor('user-uuid', 'factor-uuid');
+create or replace function supabase_auth_admin.delete_factor(
+  p_user_id uuid,
+  p_factor_id uuid
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = supabase_auth_admin
+as $$
+begin
+  return _request(
+    'delete',
+    format('admin/users/%s/factors/%s', p_user_id::text, p_factor_id::text)
+    );
+end;
+$$;
+
+  $ext$,
+  '{supabase_vault, http}'
+  );
